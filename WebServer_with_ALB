@@ -1,0 +1,250 @@
+provider "aws" {
+  region     = "us-west-2"
+  access_key = "AKIARGIE2DSYVIX4TVPB"
+  secret_key = "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"
+}
+
+#VPC Creation
+
+resource "aws_vpc" "tfvpc" {
+    cidr_block = "10.0.0.0/16"
+    tags = {
+      "Name" = "tfvpc"
+    }
+}
+
+#SUBNET Creation
+
+resource "aws_subnet" "subnet-1tf" {
+    vpc_id = aws_vpc.tfvpc.id
+    cidr_block = "10.0.0.0/17"
+    availability_zone = "us-west-2a"
+    tags = {
+      "Name" = "Subnet 1"
+    }
+}
+
+resource "aws_subnet" "subnet-2tf" {
+    vpc_id = aws_vpc.tfvpc.id
+    cidr_block = "10.0.128.0/17"
+    availability_zone = "us-west-2b"
+    tags = {
+      "Name" = "Subnet 2"
+    }
+}
+
+# Internet Gateway / Rout Table Creation & Subnet Association
+
+resource "aws_internet_gateway" "tfIG" {
+  vpc_id = aws_vpc.tfvpc.id
+}
+
+resource "aws_route_table" "tfrt" {
+    vpc_id = aws_vpc.tfvpc.id
+    route {
+        cidr_block = "0.0.0.0/0"
+        gateway_id = aws_internet_gateway.tfIG.id
+    }
+
+}
+
+resource "aws_route_table_association" "tfrtasso" {
+    subnet_id = aws_subnet.subnet-1tf.id
+    route_table_id = aws_route_table.tfrt.id
+}
+
+# Create Security Group
+
+resource "aws_security_group" "tfsg" {
+    name = "allow port 443, 80 and 22"
+    description = "allow web access"
+    vpc_id = aws_vpc.tfvpc.id
+
+    ingress {
+        description = "HHTPS"
+        from_port = 443
+        to_port = 443
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+        ingress {
+        description = "HHTP"
+        from_port = 80
+        to_port = 80
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+        ingress {
+        description = "SSH"
+        from_port = 22
+        to_port = 22
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+
+        
+        ingress {
+        description = "ICMP"
+        from_port = 8
+        to_port = 0
+        protocol = "icmp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+
+
+    egress {
+        from_port = 0
+        to_port = 0
+        protocol = "-1"
+        cidr_blocks = ["0.0.0.0/0"]        
+    }
+}
+
+# Create ENI with static IP
+resource "aws_network_interface" "tfeni" {
+  subnet_id = aws_subnet.subnet-1tf.id
+  private_ips = ["10.0.1.50"]
+  security_groups = [aws_security_group.tfsg.id]
+}
+
+resource "aws_network_interface" "tfeni2" {
+  subnet_id = aws_subnet.subnet-1tf.id
+  private_ips = ["10.0.1.51"]
+  security_groups = [aws_security_group.tfsg.id]
+}
+
+# assign elastic IP
+resource "aws_eip" "tfeip" {
+    vpc = true
+    network_interface = aws_network_interface.tfeni.id
+    associate_with_private_ip = "10.0.1.50"
+    depends_on = [aws_internet_gateway.tfIG]
+    
+}
+
+# EBS Creation
+
+resource "aws_ebs_volume" "datadrive1" {
+  availability_zone = "us-west-2a"
+  size              = 10
+  encrypted = "false"
+  type = "gp3"
+  #iops = 
+  #throughput =
+
+  tags = {
+    Name = "DataDrive1"
+  }
+}
+
+# EC2 Creation
+
+resource "aws_instance" "tfwebserver" {
+  ami = "ami-095413544ce52437d"
+  instance_type = "t2.micro"
+  availability_zone = "us-west-2a"
+  key_name = "tfec2"
+
+  network_interface {
+    device_index = 0
+    network_interface_id = aws_network_interface.tfeni.id
+  }
+user_data = <<-EOF
+#!/bin/bash
+sudo apt update -y
+sudo apt install apache2 -y
+sudo systemctl start apache2
+sudo bash -c 'echo Hi from Terraform Created WebServer 1 > /var/www/html/index.html'
+EOF
+}
+
+resource "aws_instance" "tfwebserver2" {
+  ami = "ami-095413544ce52437d"
+  instance_type = "t2.micro"
+  availability_zone = "us-west-2a"
+  key_name = "tfec2"
+
+  network_interface {
+    device_index = 0
+    network_interface_id = aws_network_interface.tfeni2.id
+  }
+user_data = <<-EOF
+#!/bin/bash
+sudo apt update -y
+sudo apt install apache2 -y
+sudo systemctl start apache2
+sudo bash -c 'echo Hi from Terraform Created WebServer 2 > /var/www/html/index.html'
+EOF
+}
+
+# Attaching EBS in EC2
+
+resource "aws_volume_attachment" "DataDrive1" {
+  device_name = "/dev/sdh"
+  volume_id   = aws_ebs_volume.datadrive1.id
+  instance_id = aws_instance.tfwebserver2.id
+}
+
+
+# ALB Creation
+
+resource "aws_lb" "tfalb" {
+  name               = "tfalb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.tfsg.id]
+  idle_timeout       = 60
+  subnets            = [aws_subnet.subnet-1tf.id, aws_subnet.subnet-2tf.id]
+}
+
+# Target group Creation
+
+resource "aws_lb_target_group" "tfalb_target_group" {
+  name        = "tfalb-tg"
+  port        = 80
+  protocol    = "HTTP"
+  target_type = "ip"
+  vpc_id      = aws_vpc.tfvpc.id
+
+  health_check {
+    enabled = true
+    path = "/"
+    port = "80"
+    protocol = "HTTP"
+    healthy_threshold = 3
+    unhealthy_threshold = 2
+    interval = 90
+    timeout = 20
+    matcher = "200"
+  }
+
+  depends_on = [aws_lb.tfalb]
+}
+
+# ALB Listener configuration
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.tfalb.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.tfalb_target_group.arn
+
+  }
+}
+
+# Attaching resource to TG
+
+resource "aws_lb_target_group_attachment" "tftg" {
+  target_group_arn = aws_lb_target_group.tfalb_target_group.arn
+  target_id        = aws_instance.tfwebserver.private_ip #instance id
+  port             = 80
+}
+
+resource "aws_lb_target_group_attachment" "tftg2" {
+  target_group_arn = aws_lb_target_group.tfalb_target_group.arn
+  target_id        = aws_instance.tfwebserver2.private_ip #instance id
+  port             = 80
+}
