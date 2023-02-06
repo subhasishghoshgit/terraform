@@ -1,0 +1,300 @@
+provider "aws" {
+  region     = "us-west-2"
+  access_key = "AKIARGIE2DSYVIX4TVPB"
+  secret_key = "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"
+}
+
+#VPC Creation
+
+resource "aws_vpc" "tfvpc" {
+    cidr_block = "10.0.0.0/16"
+    tags = {
+      "Name" = "tfvpc"
+    }
+}
+
+#SUBNET Creation
+
+resource "aws_subnet" "subnet-1tf" {
+    vpc_id = aws_vpc.tfvpc.id
+    cidr_block = "10.0.0.0/17"
+    availability_zone = "us-west-2a"
+    tags = {
+      "Name" = "Subnet 1"
+    }
+}
+
+resource "aws_subnet" "subnet-2tf" {
+    vpc_id = aws_vpc.tfvpc.id
+    cidr_block = "10.0.128.0/17"
+    availability_zone = "us-west-2b"
+    tags = {
+      "Name" = "Subnet 2"
+    }
+}
+
+# Internet Gateway / Rout Table Creation & Subnet Association
+
+resource "aws_internet_gateway" "tfIG" {
+  vpc_id = aws_vpc.tfvpc.id
+}
+
+resource "aws_route_table" "tfrt" {
+    vpc_id = aws_vpc.tfvpc.id
+    route {
+        cidr_block = "0.0.0.0/0"
+        gateway_id = aws_internet_gateway.tfIG.id
+    }
+
+}
+
+resource "aws_route_table_association" "tfrtasso" {
+    subnet_id = aws_subnet.subnet-1tf.id
+    route_table_id = aws_route_table.tfrt.id
+}
+
+# Create Security Group
+
+resource "aws_security_group" "tfsg" {
+    name = "allow port 443, 80 and 22"
+    description = "allow web access"
+    vpc_id = aws_vpc.tfvpc.id
+
+    ingress {
+        description = "HHTPS"
+        from_port = 443
+        to_port = 443
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+        ingress {
+        description = "HHTP"
+        from_port = 80
+        to_port = 80
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+        ingress {
+        description = "SSH"
+        from_port = 22
+        to_port = 22
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+
+        
+        ingress {
+        description = "ICMP"
+        from_port = 8
+        to_port = 0
+        protocol = "icmp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+
+
+    egress {
+        from_port = 0
+        to_port = 0
+        protocol = "-1"
+        cidr_blocks = ["0.0.0.0/0"]        
+    }
+}
+
+# Creating AutoScale Group & Launch Config
+
+/*
+resource "aws_launch_template" "tflt" {
+  name_prefix   = "tflt"
+  image_id      = "ami-095413544ce52437d"
+  instance_type = "t2.micro"
+  }
+*/
+
+# Creating Launch template
+
+resource "aws_launch_template" "tflt" {
+  name_prefix   = "tflt"
+  image_id      = "ami-095413544ce52437d"
+  instance_type = "t2.micro"
+    key_name = "tfec2"
+  user_data = filebase64("${path.module}/userdata.sh")
+
+  network_interfaces {
+  security_groups = [aws_security_group.tfsg.id]
+  associate_public_ip_address = true
+  subnet_id                   = aws_subnet.subnet-1tf.id
+  delete_on_termination       = true 
+}
+
+/*
+block_device_mappings {
+    device_name = "/dev/sda1"
+
+    ebs {
+      volume_size = 10
+    }
+  }
+
+#iam_instance_profile {
+ #   name = "test"
+  #}
+
+  monitoring {
+    enabled = true
+  }
+
+  #network_interfaces {
+   # associate_public_ip_address = true
+  #}
+
+  placement {
+    availability_zone = "us-west-2a"
+  }
+
+  # vpc_security_group_ids = [aws_security_group.tfsg.id]
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "AutoScaleEC2"
+    }
+  }
+*/
+  
+}
+  
+
+
+
+
+
+resource "aws_autoscaling_group" "tfasg" {
+  availability_zones = ["us-west-2a"]
+  desired_capacity   = 2
+  max_size           = 5
+  min_size           = 2
+  target_group_arns  = ["${aws_lb_target_group.tfalb_target_group.arn}"]
+  launch_template {
+    id      = aws_launch_template.tflt.id
+    version = "$Latest"
+  }
+}
+
+
+# ALB Creation
+
+resource "aws_lb" "tfalb" {
+  name               = "tfalb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.tfsg.id]
+  idle_timeout       = 60
+  subnets            = [aws_subnet.subnet-1tf.id, aws_subnet.subnet-2tf.id]
+}
+
+# Target group Creation
+
+resource "aws_lb_target_group" "tfalb_target_group" {
+  name        = "tfalb-tg"
+  port        = 80
+  protocol    = "HTTP"
+  target_type = "instance"
+  vpc_id      = aws_vpc.tfvpc.id
+
+  health_check {
+    enabled = true
+    path = "/"
+    port = "80"
+    protocol = "HTTP"
+    healthy_threshold = 3
+    unhealthy_threshold = 2
+    interval = 90
+    timeout = 20
+    matcher = "200"
+  }
+
+  depends_on = [aws_lb.tfalb]
+}
+
+
+# ALB Listener configuration
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.tfalb.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.tfalb_target_group.arn
+
+  }
+}
+
+
+# attaching ALB to AutoScaling group
+
+resource "aws_autoscaling_attachment" "asg_attachment_elb" {
+  autoscaling_group_name = aws_autoscaling_group.tfasg.id
+  lb_target_group_arn = aws_lb_target_group.tfalb_target_group.arn
+}
+
+
+
+
+
+/*
+
+module "autoscale_group" {
+  source = "cloudposse/ec2-autoscale-group/aws"
+  # Cloud Posse recommends pinning every module to a specific version
+  # version = "x.x.x"
+
+
+  image_id                    = "ami-095413544ce52437d"
+  instance_type               = "t2.micro"
+  security_group_ids          = ["aws_security_group.tfsg.id"]
+  subnet_ids                  = ["aws_subnet.subnet-1tf.id", "aws_subnet.subnet-2tf.id"]
+  health_check_type           = "EC2"
+  min_size                    = 2
+  max_size                    = 3
+  wait_for_capacity_timeout   = "30s"
+  associate_public_ip_address = true
+  user_data_base64            = base64encode(local.userdata)
+
+  # All inputs to `block_device_mappings` have to be defined
+  block_device_mappings = [
+    {
+      device_name  = "/dev/sda1"
+      no_device    = "false"
+      virtual_name = "root"
+      ebs = {
+        encrypted             = true
+        volume_size           = 20
+        delete_on_termination = true
+        iops                  = null
+        kms_key_id            = null
+        snapshot_id           = null
+        volume_type           = "standard"
+      }
+    }
+  ]
+
+  tags = {
+    Tier              = "1"
+    AutoScaleCluster = "us-west-2.testing.cloudposse.co"
+  }
+
+  # Auto-scaling policies and CloudWatch metric alarms
+
+  autoscaling_policies_enabled           = true
+  cpu_utilization_high_threshold_percent = "70"
+  cpu_utilization_low_threshold_percent  = "20"
+}
+
+*/
+
+
+
+
